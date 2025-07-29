@@ -1,6 +1,6 @@
 # Acura Finance
 
-Credit & Financing app for Acura ERP system.
+Credit & Financing app for Acura One.
 
 ## Features
 
