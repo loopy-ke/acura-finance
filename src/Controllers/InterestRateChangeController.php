@@ -1,0 +1,307 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Controllers;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\View\View;
+use App\Models\User;
+use LoopyLabs\CreditFinancing\Models\InterestRateChange;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+use LoopyLabs\CreditFinancing\Models\FinancingPartner;
+use LoopyLabs\CreditFinancing\Models\CreditLimit;
+use LoopyLabs\CreditFinancing\Services\InterestRateChangeService;
+use LoopyLabs\CreditFinancing\Services\RateChangeApprovalService;
+
+class InterestRateChangeController extends Controller
+{
+    protected InterestRateChangeService $rateChangeService;
+    protected RateChangeApprovalService $approvalService;
+
+    public function __construct(
+        InterestRateChangeService $rateChangeService,
+        RateChangeApprovalService $approvalService
+    ) {
+        $this->rateChangeService = $rateChangeService;
+        $this->approvalService = $approvalService;
+    }
+
+    /**
+     * Display rate change management dashboard
+     */
+    public function index(): View
+    {
+        $pendingChanges = $this->rateChangeService->getPendingChanges();
+        $recentChanges = InterestRateChange::with(['requestedBy', 'approvedBy'])
+            ->orderBy('created_at', 'desc')
+            ->take(20)
+            ->get();
+
+        return view('credit-financing::rate-changes.index', compact('pendingChanges', 'recentChanges'));
+    }
+
+    /**
+     * Request a system default rate change
+     */
+    public function requestSystemChange(Request $request): JsonResponse
+    {
+        $request->validate([
+            'new_rate' => 'required|numeric|min:0|max:1',
+            'reason' => 'required|string|max:500',
+            'effective_date' => 'nullable|date|after:now',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        $change = $this->rateChangeService->requestSystemDefaultRateChange(
+            newRate: $request->new_rate,
+            reason: $request->reason,
+            requestedBy: auth()->user(),
+            effectiveDate: $request->effective_date ? new \DateTime($request->effective_date) : null,
+            notes: $request->notes
+        );
+
+        // Validate the change
+        $errors = $this->approvalService->validateRateChange($change);
+        if (!empty($errors)) {
+            $change->delete();
+            return response()->json(['errors' => $errors], 422);
+        }
+
+        return response()->json([
+            'message' => 'System rate change requested successfully',
+            'change' => $change,
+            'requires_approval' => $this->approvalService->requiresApproval($change),
+        ]);
+    }
+
+    /**
+     * Request an application-specific rate change
+     */
+    public function requestApplicationChange(Request $request, CreditApplication $application): JsonResponse
+    {
+        $request->validate([
+            'new_rate' => 'required|numeric|min:0|max:1',
+            'reason' => 'required|string|max:500',
+            'effective_date' => 'nullable|date|after:now',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        $change = $this->rateChangeService->requestApplicationRateChange(
+            application: $application,
+            newRate: $request->new_rate,
+            reason: $request->reason,
+            requestedBy: auth()->user(),
+            effectiveDate: $request->effective_date ? new \DateTime($request->effective_date) : null,
+            notes: $request->notes
+        );
+
+        // Validate the change
+        $errors = $this->approvalService->validateRateChange($change);
+        if (!empty($errors)) {
+            $change->delete();
+            return response()->json(['errors' => $errors], 422);
+        }
+
+        return response()->json([
+            'message' => 'Application rate change requested successfully',
+            'change' => $change,
+            'requires_approval' => $this->approvalService->requiresApproval($change),
+        ]);
+    }
+
+    /**
+     * Request a partner rate change
+     */
+    public function requestPartnerChange(Request $request, FinancingPartner $partner): JsonResponse
+    {
+        $request->validate([
+            'new_rate' => 'required|numeric|min:0|max:1',
+            'reason' => 'required|string|max:500',
+            'effective_date' => 'nullable|date|after:now',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        $change = $this->rateChangeService->requestPartnerRateChange(
+            partner: $partner,
+            newRate: $request->new_rate,
+            reason: $request->reason,
+            requestedBy: auth()->user(),
+            effectiveDate: $request->effective_date ? new \DateTime($request->effective_date) : null,
+            notes: $request->notes
+        );
+
+        // Validate the change
+        $errors = $this->approvalService->validateRateChange($change);
+        if (!empty($errors)) {
+            $change->delete();
+            return response()->json(['errors' => $errors], 422);
+        }
+
+        return response()->json([
+            'message' => 'Partner rate change requested successfully',
+            'change' => $change,
+            'requires_approval' => $this->approvalService->requiresApproval($change),
+        ]);
+    }
+
+    /**
+     * Request bulk rate changes
+     */
+    public function requestBulkChange(Request $request): JsonResponse
+    {
+        $request->validate([
+            'entities' => 'required|array|min:1',
+            'entities.*.id' => 'required|integer',
+            'new_rate' => 'required|numeric|min:0|max:1',
+            'reason' => 'required|string|max:500',
+            'effective_date' => 'nullable|date|after:now',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        $changes = $this->rateChangeService->requestBulkRateChange(
+            entities: $request->entities,
+            newRate: $request->new_rate,
+            reason: $request->reason,
+            requestedBy: auth()->user(),
+            effectiveDate: $request->effective_date ? new \DateTime($request->effective_date) : null,
+            notes: $request->notes
+        );
+
+        return response()->json([
+            'message' => 'Bulk rate change requested successfully',
+            'changes_count' => $changes->count(),
+            'batch_id' => $changes->first()->batch_id,
+        ]);
+    }
+
+    /**
+     * Approve or reject a rate change
+     */
+    public function processApproval(Request $request, InterestRateChange $change): JsonResponse
+    {
+        $request->validate([
+            'action' => 'required|in:approve,reject',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        try {
+            $approve = $request->action === 'approve';
+            
+            $this->approvalService->processApproval(
+                change: $change,
+                approver: auth()->user(),
+                approve: $approve,
+                notes: $request->notes
+            );
+
+            $message = $approve ? 'Rate change approved successfully' : 'Rate change rejected';
+            
+            return response()->json([
+                'message' => $message,
+                'change' => $change->fresh(),
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 403);
+        }
+    }
+
+    /**
+     * Apply an approved rate change
+     */
+    public function applyChange(InterestRateChange $change): JsonResponse
+    {
+        if ($change->status !== 'approved') {
+            return response()->json(['error' => 'Only approved changes can be applied'], 422);
+        }
+
+        $success = $this->rateChangeService->applyRateChange($change);
+
+        if ($success) {
+            return response()->json([
+                'message' => 'Rate change applied successfully',
+                'change' => $change->fresh(),
+            ]);
+        } else {
+            return response()->json(['error' => 'Failed to apply rate change'], 500);
+        }
+    }
+
+    /**
+     * Get rate change history for an entity
+     */
+    public function getHistory(Request $request): JsonResponse
+    {
+        $request->validate([
+            'entity_type' => 'required|string',
+            'entity_id' => 'nullable|integer',
+        ]);
+
+        $history = $this->rateChangeService->getRateHistory(
+            $request->entity_type,
+            $request->entity_id
+        );
+
+        return response()->json(['history' => $history]);
+    }
+
+    /**
+     * Get impact analysis for a potential rate change
+     */
+    public function getImpactAnalysis(Request $request): JsonResponse
+    {
+        $request->validate([
+            'entity_type' => 'required|string',
+            'entity_id' => 'nullable|integer',
+            'new_rate' => 'required|numeric|min:0|max:1',
+        ]);
+
+        $impact = $this->rateChangeService->getImpactAnalysis(
+            $request->entity_type,
+            $request->entity_id,
+            $request->new_rate
+        );
+
+        return response()->json(['impact' => $impact]);
+    }
+
+    /**
+     * Show detailed view of a rate change
+     */
+    public function show(InterestRateChange $change): View
+    {
+        $change->load(['requestedBy', 'approvedBy']);
+        
+        $approvalHistory = $this->approvalService->getApprovalHistory($change);
+        $requiredApprovers = $this->approvalService->getRequiredApprovers($change);
+        $canApprove = $this->approvalService->canApprove(auth()->user(), $change);
+
+        return view('credit-financing::rate-changes.show', compact(
+            'change',
+            'approvalHistory',
+            'requiredApprovers',
+            'canApprove'
+        ));
+    }
+
+    /**
+     * Cancel a pending rate change
+     */
+    public function cancel(Request $request, InterestRateChange $change): JsonResponse
+    {
+        $request->validate([
+            'reason' => 'nullable|string|max:500',
+        ]);
+
+        $success = $change->cancel($request->reason);
+
+        if ($success) {
+            return response()->json([
+                'message' => 'Rate change cancelled successfully',
+                'change' => $change->fresh(),
+            ]);
+        } else {
+            return response()->json(['error' => 'Cannot cancel this rate change'], 422);
+        }
+    }
+}

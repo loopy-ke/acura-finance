@@ -1,0 +1,405 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Services;
+
+use Illuminate\Support\Str;
+use Illuminate\Support\Collection;
+use App\Models\User;
+use LoopyLabs\CreditFinancing\Models\InterestRateChange;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+use LoopyLabs\CreditFinancing\Models\CreditDisbursement;
+use LoopyLabs\CreditFinancing\Models\FinancingPartner;
+
+class InterestRateChangeService
+{
+    /**
+     * Request a system default rate change
+     */
+    public function requestSystemDefaultRateChange(
+        float $newRate,
+        string $reason,
+        User $requestedBy,
+        string $changeType = 'manual',
+        \DateTime $effectiveDate = null,
+        string $notes = null
+    ): InterestRateChange {
+        $oldRate = (float) setting('credit_financing.default_interest_rate', 0.12);
+        $effectiveDate = $effectiveDate ?? now();
+
+        return InterestRateChange::create([
+            'entity_type' => 'system_default',
+            'entity_id' => null,
+            'old_rate' => $oldRate,
+            'new_rate' => $newRate,
+            'effective_date' => $effectiveDate,
+            'change_reason' => $reason,
+            'change_notes' => $notes,
+            'change_type' => $changeType,
+            'requested_by' => $requestedBy->id,
+            'status' => 'pending',
+        ]);
+    }
+
+    /**
+     * Request a financing partner rate change
+     */
+    public function requestPartnerRateChange(
+        FinancingPartner $partner,
+        float $newRate,
+        string $reason,
+        User $requestedBy,
+        string $changeType = 'manual',
+        \DateTime $effectiveDate = null,
+        string $notes = null
+    ): InterestRateChange {
+        $oldRate = $partner->default_interest_rate ?? 0.12;
+        $effectiveDate = $effectiveDate ?? now();
+
+        return InterestRateChange::create([
+            'entity_id' => $partner->id,
+            'old_rate' => $oldRate,
+            'new_rate' => $newRate,
+            'effective_date' => $effectiveDate,
+            'change_reason' => $reason,
+            'change_notes' => $notes,
+            'change_type' => $changeType,
+            'requested_by' => $requestedBy->id,
+            'status' => 'pending',
+        ]);
+    }
+
+    /**
+     * Request an individual application rate change
+     */
+    public function requestApplicationRateChange(
+        CreditApplication $application,
+        float $newRate,
+        string $reason,
+        User $requestedBy,
+        string $changeType = 'manual',
+        \DateTime $effectiveDate = null,
+        string $notes = null
+    ): InterestRateChange {
+        $oldRate = $application->approved_interest_rate ?? 0.12;
+        $effectiveDate = $effectiveDate ?? now();
+
+        return InterestRateChange::create([
+            'entity_type' => 'credit_application',
+            'entity_id' => $application->id,
+            'old_rate' => $oldRate,
+            'new_rate' => $newRate,
+            'effective_date' => $effectiveDate,
+            'change_reason' => $reason,
+            'change_notes' => $notes,
+            'change_type' => $changeType,
+            'requested_by' => $requestedBy->id,
+            'status' => 'pending',
+            'applications_affected' => 1,
+            'total_amount_affected' => $application->approved_amount ?? 0,
+        ]);
+    }
+
+    /**
+     * Request a credit limit rate change
+     */
+    public function requestCreditLimitRateChange(
+        CreditLimit $creditLimit,
+        float $newRate,
+        string $reason,
+        User $requestedBy,
+        string $changeType = 'manual',
+        \DateTime $effectiveDate = null,
+        string $notes = null
+    ): InterestRateChange {
+        $oldRate = $creditLimit->default_interest_rate ?? 0.12;
+        $effectiveDate = $effectiveDate ?? now();
+
+        return InterestRateChange::create([
+            'entity_type' => 'credit_limit',
+            'entity_id' => $creditLimit->id,
+            'old_rate' => $oldRate,
+            'new_rate' => $newRate,
+            'effective_date' => $effectiveDate,
+            'change_reason' => $reason,
+            'change_notes' => $notes,
+            'change_type' => $changeType,
+            'requested_by' => $requestedBy->id,
+            'status' => 'pending',
+        ]);
+    }
+
+    /**
+     * Request bulk rate changes
+     */
+    public function requestBulkRateChange(
+        array $entities, // [['type' => 'credit_application', 'id' => 1], ...]
+        float $newRate,
+        string $reason,
+        User $requestedBy,
+        string $changeType = 'bulk_update',
+        \DateTime $effectiveDate = null,
+        string $notes = null
+    ): Collection {
+        $batchId = 'bulk_' . Str::uuid();
+        $effectiveDate = $effectiveDate ?? now();
+        $changes = collect();
+
+        foreach ($entities as $entity) {
+            $oldRate = $this->getCurrentRate($entity['type'], $entity['id']);
+            
+            $change = InterestRateChange::create([
+                'entity_type' => $entity['type'],
+                'entity_id' => $entity['id'],
+                'old_rate' => $oldRate,
+                'new_rate' => $newRate,
+                'effective_date' => $effectiveDate,
+                'change_reason' => $reason,
+                'change_notes' => $notes,
+                'change_type' => $changeType,
+                'requested_by' => $requestedBy->id,
+                'status' => 'pending',
+                'batch_id' => $batchId,
+                'affected_entities' => $entities,
+            ]);
+
+            $changes->push($change);
+        }
+
+        // Update impact statistics for the batch
+        $this->updateBatchImpactStatistics($batchId);
+
+        return $changes;
+    }
+
+    /**
+     * Apply approved rate changes
+     */
+    public function applyRateChange(InterestRateChange $change): bool
+    {
+        if ($change->status !== 'approved') {
+            return false;
+        }
+
+        $success = false;
+
+        switch ($change->entity_type) {
+            case 'system_default':
+                $success = $this->applySystemDefaultChange($change);
+                break;
+                $success = $this->applyPartnerChange($change);
+                break;
+            case 'credit_application':
+                $success = $this->applyApplicationChange($change);
+                break;
+            case 'credit_limit':
+                $success = $this->applyCreditLimitChange($change);
+                break;
+            case 'credit_disbursement':
+                $success = $this->applyDisbursementChange($change);
+                break;
+        }
+
+        if ($success) {
+            $change->apply();
+        }
+
+        return $success;
+    }
+
+    /**
+     * Get rate change history for an entity
+     */
+    public function getRateHistory(string $entityType, $entityId = null): Collection
+    {
+        return InterestRateChange::forEntity($entityType, $entityId)
+            ->orderBy('effective_date', 'desc')
+            ->get();
+    }
+
+    /**
+     * Get pending rate changes
+     */
+    public function getPendingChanges(): Collection
+    {
+        return InterestRateChange::pending()
+            ->with(['requestedBy', 'entity'])
+            ->orderBy('created_at', 'desc')
+            ->get();
+    }
+
+    /**
+     * Get impact analysis for a potential rate change
+     */
+    public function getImpactAnalysis(string $entityType, $entityId, float $newRate): array
+    {
+        $currentRate = $this->getCurrentRate($entityType, $entityId);
+        $rateDifference = $newRate - $currentRate;
+        $percentageChange = $currentRate > 0 ? (($rateDifference / $currentRate) * 100) : 0;
+
+        $analysis = [
+            'current_rate' => $currentRate,
+            'new_rate' => $newRate,
+            'rate_difference' => $rateDifference,
+            'percentage_change' => $percentageChange,
+            'applications_affected' => 0,
+            'disbursements_affected' => 0,
+            'total_amount_affected' => 0,
+        ];
+
+        // Calculate specific impacts based on entity type
+        switch ($entityType) {
+            case 'system_default':
+                $analysis = array_merge($analysis, $this->getSystemDefaultImpact());
+                break;
+                $analysis = array_merge($analysis, $this->getPartnerImpact($entityId));
+                break;
+            case 'credit_application':
+                $analysis = array_merge($analysis, $this->getApplicationImpact($entityId));
+                break;
+        }
+
+        return $analysis;
+    }
+
+    // Private helper methods
+
+    private function getCurrentRate(string $entityType, $entityId): float
+    {
+        switch ($entityType) {
+            case 'system_default':
+                return (float) setting('credit_financing.default_interest_rate', 0.12);
+                return FinancingPartner::find($entityId)?->default_interest_rate ?? 0.12;
+            case 'credit_application':
+                return CreditApplication::find($entityId)?->approved_interest_rate ?? 0.12;
+            case 'credit_limit':
+                return CreditLimit::find($entityId)?->default_interest_rate ?? 0.12;
+            case 'credit_disbursement':
+                return CreditDisbursement::find($entityId)?->interest_rate ?? 0.12;
+            default:
+                return 0.12;
+        }
+    }
+
+    private function applySystemDefaultChange(InterestRateChange $change): bool
+    {
+        try {
+            // Update the setting
+            setting('credit_financing.default_interest_rate', $change->new_rate);
+            return true;
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    private function applyPartnerChange(InterestRateChange $change): bool
+    {
+        $partner = FinancingPartner::find($change->entity_id);
+        if (!$partner) {
+            return false;
+        }
+
+        return $partner->update(['default_interest_rate' => $change->new_rate]);
+    }
+
+    private function applyApplicationChange(InterestRateChange $change): bool
+    {
+        $application = CreditApplication::find($change->entity_id);
+        if (!$application) {
+            return false;
+        }
+
+        return $application->update(['approved_interest_rate' => $change->new_rate]);
+    }
+
+    private function applyCreditLimitChange(InterestRateChange $change): bool
+    {
+        $creditLimit = CreditLimit::find($change->entity_id);
+        if (!$creditLimit) {
+            return false;
+        }
+
+        return $creditLimit->update(['default_interest_rate' => $change->new_rate]);
+    }
+
+    private function applyDisbursementChange(InterestRateChange $change): bool
+    {
+        $disbursement = CreditDisbursement::find($change->entity_id);
+        if (!$disbursement) {
+            return false;
+        }
+
+        return $disbursement->update(['interest_rate' => $change->new_rate]);
+    }
+
+    private function getSystemDefaultImpact(): array
+    {
+        $futureApplications = CreditApplication::where('status', 'pending')->count();
+        $activeDisbursements = CreditDisbursement::where('status', 'active')->count();
+        $totalAmount = CreditDisbursement::where('status', 'active')->sum('amount');
+
+        return [
+            'applications_affected' => $futureApplications,
+            'disbursements_affected' => $activeDisbursements,
+            'total_amount_affected' => $totalAmount,
+        ];
+    }
+
+    private function getPartnerImpact($partnerId): array
+    {
+            ->whereIn('status', ['pending', 'approved'])
+            ->count();
+        
+        $disbursements = CreditDisbursement::whereHas('application', function ($q) use ($partnerId) {
+        })->where('status', 'active')->count();
+
+        $totalAmount = CreditDisbursement::whereHas('application', function ($q) use ($partnerId) {
+        })->where('status', 'active')->sum('amount');
+
+        return [
+            'applications_affected' => $applications,
+            'disbursements_affected' => $disbursements,
+            'total_amount_affected' => $totalAmount,
+        ];
+    }
+
+    private function getApplicationImpact($applicationId): array
+    {
+        $application = CreditApplication::find($applicationId);
+        $disbursements = CreditDisbursement::where('credit_application_id', $applicationId)
+            ->where('status', 'active')
+            ->count();
+        
+        $totalAmount = CreditDisbursement::where('credit_application_id', $applicationId)
+            ->where('status', 'active')
+            ->sum('amount');
+
+        return [
+            'applications_affected' => 1,
+            'disbursements_affected' => $disbursements,
+            'total_amount_affected' => $totalAmount,
+        ];
+    }
+
+    private function updateBatchImpactStatistics(string $batchId): void
+    {
+        $changes = InterestRateChange::where('batch_id', $batchId)->get();
+        
+        $totalApplications = 0;
+        $totalDisbursements = 0;
+        $totalAmount = 0;
+
+        foreach ($changes as $change) {
+            $impact = $this->getImpactAnalysis($change->entity_type, $change->entity_id, $change->new_rate);
+            $totalApplications += $impact['applications_affected'];
+            $totalDisbursements += $impact['disbursements_affected'];
+            $totalAmount += $impact['total_amount_affected'];
+        }
+
+        // Update all changes in the batch with the totals
+        InterestRateChange::where('batch_id', $batchId)->update([
+            'applications_affected' => $totalApplications,
+            'disbursements_affected' => $totalDisbursements,
+            'total_amount_affected' => $totalAmount,
+        ]);
+    }
+}

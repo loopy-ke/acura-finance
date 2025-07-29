@@ -1,0 +1,356 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Controllers;
+
+use App\Http\Controllers\Controller;
+use LoopyLabs\CreditFinancing\Contracts\CreditProcessorInterface;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+use LoopyLabs\CreditFinancing\Models\FinancingPartner;
+use LoopyLabs\CreditFinancing\Requests\StoreCreditApplicationRequest;
+use LoopyLabs\CreditFinancing\Requests\UpdateCreditApplicationRequest;
+use App\Models\Customer;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class CreditApplicationController extends Controller
+{
+    protected CreditProcessorInterface $creditProcessor;
+
+    public function __construct(CreditProcessorInterface $creditProcessor)
+    {
+        $this->creditProcessor = $creditProcessor;
+        $this->middleware('auth');
+    }
+
+    public function index(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $query = CreditApplication::with(['customer', 'financingPartner', 'createdBy', 'latestDecision'])
+            ->orderBy('created_at', 'desc');
+
+        // Filter by status
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        // Filter by customer
+        if ($request->filled('customer_id')) {
+            $query->where('customer_id', $request->customer_id);
+        }
+
+        // Filter by date range
+        if ($request->filled('from_date')) {
+            $query->where('created_at', '>=', $request->from_date);
+        }
+        if ($request->filled('to_date')) {
+            $query->where('created_at', '<=', $request->to_date);
+        }
+
+        // Search by application number or customer name
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('application_number', 'like', "%{$search}%")
+                  ->orWhereHas('customer', function($customerQuery) use ($search) {
+                      $customerQuery->where('company_name', 'like', "%{$search}%");
+                  });
+            });
+        }
+
+        $applications = $query->paginate(15);
+
+        $stats = $this->getApplicationStats();
+
+        return view('credit-financing::applications.index', compact('applications', 'stats'));
+    }
+
+    public function create()
+    {
+        $this->authorize('create', CreditApplication::class);
+
+        $customers = Customer::where('is_active', true)
+            ->where('financing_enabled', true)
+            ->orderBy('company_name')
+            ->get();
+
+        $financingPartners = FinancingPartner::where('is_active', true)
+            ->orderBy('partner_name')
+            ->get();
+
+        return view('credit-financing::applications.create', compact('customers', 'financingPartners'));
+    }
+
+    public function store(StoreCreditApplicationRequest $request)
+    {
+        $this->authorize('create', CreditApplication::class);
+
+        $application = DB::transaction(function () use ($request) {
+            $application = CreditApplication::create([
+                'customer_id' => $request->customer_id,
+                'financing_partner_id' => $request->financing_partner_id,
+                'requested_amount' => $request->requested_amount,
+                'requested_term_months' => $request->requested_term_months,
+                'purpose' => $request->purpose,
+                'business_justification' => $request->business_justification,
+                'created_by' => auth()->id(),
+                'status' => 'draft',
+            ]);
+
+            // If auto-submit is requested, process immediately
+            if ($request->auto_submit) {
+                return $this->submitApplication($application);
+            }
+
+            return $application;
+        });
+
+        if ($request->auto_submit) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('success', 'Credit application submitted and processed successfully.');
+        }
+
+        return redirect()
+            ->route('credit.applications.show', $application)
+            ->with('success', 'Credit application created successfully.');
+    }
+
+    public function show(CreditApplication $application)
+    {
+        $this->authorize('view', $application);
+
+        $application->load([
+            'customer',
+            'financingPartner',
+            'createdBy',
+            'approvedBy',
+            'deniedBy',
+            'decisions.decidedBy',
+            'financedInvoices'
+        ]);
+
+        return view('credit-financing::applications.show', compact('application'));
+    }
+
+    public function edit(CreditApplication $application)
+    {
+        $this->authorize('update', $application);
+
+        if (!$application->canBeEdited()) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'This application cannot be edited in its current status.');
+        }
+
+        $customers = Customer::where('is_active', true)
+            ->where('financing_enabled', true)
+            ->orderBy('company_name')
+            ->get();
+
+        $financingPartners = FinancingPartner::where('is_active', true)
+            ->orderBy('partner_name')
+            ->get();
+
+        return view('credit-financing::applications.edit', compact('application', 'customers', 'financingPartners'));
+    }
+
+    public function update(UpdateCreditApplicationRequest $request, CreditApplication $application)
+    {
+        $this->authorize('update', $application);
+
+        if (!$application->canBeEdited()) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'This application cannot be edited in its current status.');
+        }
+
+        $application->update([
+            'customer_id' => $request->customer_id,
+            'financing_partner_id' => $request->financing_partner_id,
+            'requested_amount' => $request->requested_amount,
+            'requested_term_months' => $request->requested_term_months,
+            'purpose' => $request->purpose,
+            'business_justification' => $request->business_justification,
+        ]);
+
+        return redirect()
+            ->route('credit.applications.show', $application)
+            ->with('success', 'Credit application updated successfully.');
+    }
+
+    public function destroy(CreditApplication $application)
+    {
+        $this->authorize('delete', $application);
+
+        if (!$application->canBeDeleted()) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'This application cannot be deleted in its current status.');
+        }
+
+        $application->delete();
+
+        return redirect()
+            ->route('credit.applications.index')
+            ->with('success', 'Credit application deleted successfully.');
+    }
+
+    public function submit(CreditApplication $application)
+    {
+        $this->authorize('update', $application);
+
+        if ($application->status !== 'draft') {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'Only draft applications can be submitted.');
+        }
+
+        $this->submitApplication($application);
+
+        return redirect()
+            ->route('credit.applications.show', $application)
+            ->with('success', 'Credit application submitted and processed successfully.');
+    }
+
+    public function approve(Request $request, CreditApplication $application)
+    {
+        $this->authorize('approve', $application);
+
+        if (!$application->canBeApproved()) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'This application cannot be approved in its current status.');
+        }
+
+        $request->validate([
+            'approved_amount' => 'required|numeric|min:1|max:' . $application->requested_amount,
+            'approved_term_months' => 'required|integer|min:1|max:60',
+            'approved_interest_rate' => 'required|numeric|min:0|max:1',
+            'approved_fee_percentage' => 'required|numeric|min:0|max:1',
+            'conditions' => 'nullable|string|max:1000',
+        ]);
+
+        $terms = [
+            'amount' => $request->approved_amount,
+            'term_months' => $request->approved_term_months,
+            'interest_rate' => $request->approved_interest_rate,
+            'fee_percentage' => $request->approved_fee_percentage,
+            'conditions' => $request->conditions,
+        ];
+
+        $this->creditProcessor->approveCredit($application, $terms);
+
+        return redirect()
+            ->route('credit.applications.show', $application)
+            ->with('success', 'Credit application approved successfully.');
+    }
+
+    public function deny(Request $request, CreditApplication $application)
+    {
+        $this->authorize('approve', $application);
+
+        if (!$application->canBeDenied()) {
+            return redirect()
+                ->route('credit.applications.show', $application)
+                ->with('error', 'This application cannot be denied in its current status.');
+        }
+
+        $request->validate([
+            'denial_reason' => 'required|string|max:1000',
+        ]);
+
+        $this->creditProcessor->denyCredit($application, $request->denial_reason);
+
+        return redirect()
+            ->route('credit.applications.show', $application)
+            ->with('success', 'Credit application denied.');
+    }
+
+    public function export(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $query = CreditApplication::with(['customer', 'financingPartner', 'createdBy']);
+
+        // Apply same filters as index
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+        if ($request->filled('customer_id')) {
+            $query->where('customer_id', $request->customer_id);
+        }
+        if ($request->filled('from_date')) {
+            $query->where('created_at', '>=', $request->from_date);
+        }
+        if ($request->filled('to_date')) {
+            $query->where('created_at', '<=', $request->to_date);
+        }
+
+        $applications = $query->get();
+
+        // Return CSV export
+        $headers = [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => 'attachment; filename="credit_applications_' . now()->format('Y-m-d') . '.csv"',
+        ];
+
+        $callback = function() use ($applications) {
+            $file = fopen('php://output', 'w');
+            
+            // CSV headers
+            fputcsv($file, [
+                'Application Number',
+                'Customer',
+                'Requested Amount',
+                'Approved Amount',
+                'Status',
+                'Submission Date',
+                'Decision Date',
+                'Created By',
+            ]);
+
+            // CSV data
+            foreach ($applications as $application) {
+                fputcsv($file, [
+                    $application->application_number,
+                    $application->customer->company_name,
+                    number_format($application->requested_amount, 2),
+                    $application->approved_amount ? number_format($application->approved_amount, 2) : '',
+                    ucfirst($application->status),
+                    $application->submission_date?->format('Y-m-d'),
+                    $application->decision_date?->format('Y-m-d'),
+                    $application->createdBy->name,
+                ]);
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
+    protected function submitApplication(CreditApplication $application): CreditApplication
+    {
+        $application->update([
+            'status' => 'submitted',
+            'submission_date' => now(),
+        ]);
+
+        // Process the application
+        $this->creditProcessor->processApplication($application);
+
+        return $application->fresh();
+    }
+
+    protected function getApplicationStats(): array
+    {
+        return [
+            'total' => CreditApplication::count(),
+            'pending' => CreditApplication::whereIn('status', ['submitted', 'under_review'])->count(),
+            'approved' => CreditApplication::where('status', 'approved')->count(),
+            'denied' => CreditApplication::where('status', 'denied')->count(),
+            'total_approved_amount' => CreditApplication::where('status', 'approved')->sum('approved_amount'),
+        ];
+    }
+}

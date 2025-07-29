@@ -1,0 +1,110 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+use LoopyLabs\CreditFinancing\Controllers\CreditApplicationController;
+use LoopyLabs\CreditFinancing\Controllers\CreditLimitController;
+use LoopyLabs\CreditFinancing\Controllers\CreditReportController;
+use LoopyLabs\CreditFinancing\Controllers\CreditReviewController;
+use LoopyLabs\CreditFinancing\Controllers\CreditDisbursementController;
+use LoopyLabs\CreditFinancing\Controllers\CustomerCreditController;
+use LoopyLabs\CreditFinancing\Http\Controllers\CreditCollectionController;
+
+/*
+|--------------------------------------------------------------------------
+| Credit Financing Routes
+|--------------------------------------------------------------------------
+*/
+
+Route::middleware(['web', 'auth'])->prefix('credit')->name('credit.')->group(function () {
+    
+    // Credit Applications
+    Route::resource('applications', CreditApplicationController::class);
+    Route::post('applications/{application}/submit', [CreditApplicationController::class, 'submit'])
+        ->name('applications.submit');
+    Route::post('applications/{application}/approve', [CreditApplicationController::class, 'approve'])
+        ->name('applications.approve');
+    Route::post('applications/{application}/deny', [CreditApplicationController::class, 'deny'])
+        ->name('applications.deny');
+    Route::get('applications/export', [CreditApplicationController::class, 'export'])
+        ->name('applications.export');
+    
+    // Credit Limits
+    Route::resource('limits', CreditLimitController::class);
+    Route::post('limits/{limit}/activate', [CreditLimitController::class, 'activate'])
+        ->name('limits.activate');
+    Route::post('limits/{limit}/suspend', [CreditLimitController::class, 'suspend'])
+        ->name('limits.suspend');
+    
+    // Review & Approval Workflow
+    Route::prefix('review')->name('review.')->group(function () {
+        Route::get('/', [CreditReviewController::class, 'dashboard'])->name('dashboard');
+        Route::get('applications/{application}', [CreditReviewController::class, 'show'])->name('show');
+        Route::post('applications/{application}/submit', [CreditReviewController::class, 'submitForReview'])->name('submit');
+        Route::post('applications/{application}/approve', [CreditReviewController::class, 'approve'])->name('approve');
+        Route::post('applications/{application}/deny', [CreditReviewController::class, 'deny'])->name('deny');
+        Route::post('applications/{application}/escalate', [CreditReviewController::class, 'escalate'])->name('escalate');
+        Route::post('applications/{application}/reassign', [CreditReviewController::class, 'reassign'])->name('reassign');
+        Route::post('bulk-assign', [CreditReviewController::class, 'bulkAssign'])->name('bulk-assign');
+    });
+    
+    // Disbursements
+    Route::resource('disbursements', CreditDisbursementController::class);
+    Route::post('disbursements/{disbursement}/process', [CreditDisbursementController::class, 'process'])
+        ->name('disbursements.process');
+    Route::post('disbursements/{disbursement}/payment', [CreditDisbursementController::class, 'recordPayment'])
+        ->name('disbursements.payment');
+    Route::get('portfolio', [CreditDisbursementController::class, 'portfolio'])
+        ->name('disbursements.portfolio');
+    Route::get('disbursements/export', [CreditDisbursementController::class, 'export'])
+        ->name('disbursements.export');
+    
+    // Reports
+    Route::prefix('reports')->name('reports.')->group(function () {
+        Route::get('/', [CreditReportController::class, 'index'])->name('index');
+        Route::get('applications', [CreditReportController::class, 'applications'])->name('applications');
+        Route::get('performance', [CreditReportController::class, 'performance'])->name('performance');
+        Route::get('risk-analysis', [CreditReportController::class, 'riskAnalysis'])->name('risk-analysis');
+        Route::get('portfolio', [CreditReportController::class, 'portfolio'])->name('portfolio');
+        Route::get('aging', [CreditReportController::class, 'aging'])->name('aging');
+        Route::get('export/{type}', [CreditReportController::class, 'export'])->name('export');
+    });
+
+    // Collection Management
+    Route::prefix('collection')->name('collection.')->group(function () {
+        Route::get('', [CreditCollectionController::class, 'index'])->name('index');
+        Route::get('create', [CreditCollectionController::class, 'create'])->name('create');
+        Route::post('', [CreditCollectionController::class, 'store'])->name('store');
+        Route::get('{case}', [CreditCollectionController::class, 'show'])->name('show');
+        Route::patch('{case}', [CreditCollectionController::class, 'update'])->name('update');
+        
+        // Collection Activities
+        Route::post('{case}/activities', [CreditCollectionController::class, 'recordActivity'])->name('activities.store');
+        
+        // Payment Plans
+        Route::post('{case}/payment-plans', [CreditCollectionController::class, 'createPaymentPlan'])->name('payment-plans.store');
+        
+        // Payment Processing
+        Route::post('{case}/payments', [CreditCollectionController::class, 'processPayment'])->name('payments.store');
+        
+        // Case Management
+        Route::post('{case}/escalate', [CreditCollectionController::class, 'escalate'])->name('escalate');
+        Route::post('{case}/assign', [CreditCollectionController::class, 'assign'])->name('assign');
+        Route::post('{case}/resolve', [CreditCollectionController::class, 'resolve'])->name('resolve');
+        Route::post('{case}/close', [CreditCollectionController::class, 'close'])->name('close');
+        
+        // Bulk Operations
+        Route::post('bulk-update', [CreditCollectionController::class, 'bulkUpdate'])->name('bulk-update');
+        
+        // API Endpoints
+        Route::get('api/metrics', [CreditCollectionController::class, 'getMetrics'])->name('api.metrics');
+        Route::get('export/report', [CreditCollectionController::class, 'exportReport'])->name('export.report');
+    });
+
+    // Customer Credit Profiles
+    Route::prefix('customers')->name('customers.')->group(function () {
+        Route::get('/', [CustomerCreditController::class, 'index'])->name('index');
+        Route::get('{customer}', [CustomerCreditController::class, 'show'])->name('show');
+        Route::get('{customer}/profile', [CustomerCreditController::class, 'edit'])->name('profile');
+        Route::put('{customer}', [CustomerCreditController::class, 'update'])->name('update');
+    });
+});

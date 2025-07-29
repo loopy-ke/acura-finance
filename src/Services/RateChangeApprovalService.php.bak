@@ -1,0 +1,367 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Services;
+
+use App\Models\User;
+use LoopyLabs\CreditFinancing\Models\InterestRateChange;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+
+class RateChangeApprovalService
+{
+    /**
+     * Approval thresholds and rules
+     */
+    const APPROVAL_RULES = [
+        'system_default' => [
+            'required_role' => 'director',
+            'max_auto_approve' => 0, // Always requires approval
+            'max_change_percentage' => 50, // Max 50% change
+        ],
+        'financing_partner' => [
+            'required_role' => 'manager',
+            'max_auto_approve' => 0, // Always requires approval
+            'max_change_percentage' => 30,
+        ],
+        'credit_application' => [
+            'required_role' => 'senior',
+            'max_auto_approve' => 1000, // Auto approve up to 1% change
+            'max_change_percentage' => 25,
+            'customer_specific_rules' => true,
+        ],
+        'credit_limit' => [
+            'required_role' => 'manager',
+            'max_auto_approve' => 0.5, // Auto approve up to 0.5% change
+            'max_change_percentage' => 20,
+        ],
+        'credit_disbursement' => [
+            'required_role' => 'senior',
+            'max_auto_approve' => 0.5,
+            'max_change_percentage' => 15,
+        ],
+    ];
+
+    /**
+     * Customer-specific approval rules based on risk profile
+     */
+    const CUSTOMER_APPROVAL_RULES = [
+        'high_risk' => [
+            'max_rate_decrease' => 2.0, // Max 2% decrease
+            'required_role' => 'director',
+            'requires_justification' => true,
+            'additional_approvers' => 1,
+        ],
+        'medium_risk' => [
+            'max_rate_decrease' => 3.0, // Max 3% decrease
+            'required_role' => 'manager',
+            'requires_justification' => true,
+            'additional_approvers' => 0,
+        ],
+        'low_risk' => [
+            'max_rate_decrease' => 5.0, // Max 5% decrease
+            'required_role' => 'senior',
+            'requires_justification' => false,
+            'additional_approvers' => 0,
+        ],
+    ];
+
+    /**
+     * Check if a rate change requires approval
+     */
+    public function requiresApproval(InterestRateChange $change): bool
+    {
+        $rules = self::APPROVAL_RULES[$change->entity_type] ?? [];
+        
+        if (empty($rules)) {
+            return true; // Unknown entity types require approval
+        }
+
+        // Check if change exceeds auto-approval threshold
+        $rateDifferencePercentage = abs($change->percentage_change);
+        $maxAutoApprove = $rules['max_auto_approve'] ?? 0;
+
+        if ($rateDifferencePercentage > $maxAutoApprove) {
+            return true;
+        }
+
+        // Check customer-specific rules for applications
+        if ($change->entity_type === 'credit_application') {
+            return $this->requiresCustomerSpecificApproval($change);
+        }
+
+        // For very small changes, may not require approval
+        return $rateDifferencePercentage > $maxAutoApprove;
+    }
+
+    /**
+     * Check if user can approve a rate change
+     */
+    public function canApprove(User $user, InterestRateChange $change): bool
+    {
+        $rules = self::APPROVAL_RULES[$change->entity_type] ?? [];
+        $requiredRole = $rules['required_role'] ?? 'director';
+
+        // Check if user has required role
+        if (!$this->hasRequiredRole($user, $requiredRole)) {
+            return false;
+        }
+
+        // Check if change is within allowed limits
+        $maxChangePercentage = $rules['max_change_percentage'] ?? 50;
+        if (abs($change->percentage_change) > $maxChangePercentage) {
+            return false;
+        }
+
+        // Additional checks for customer-specific rates
+        if ($change->entity_type === 'credit_application') {
+            return $this->canApproveCustomerRate($user, $change);
+        }
+
+        return true;
+    }
+
+    /**
+     * Get required approvers for a rate change
+     */
+    public function getRequiredApprovers(InterestRateChange $change): array
+    {
+        $rules = self::APPROVAL_RULES[$change->entity_type] ?? [];
+        $requiredRole = $rules['required_role'] ?? 'director';
+
+        $approvers = [
+            'primary_role' => $requiredRole,
+            'additional_count' => 0,
+            'specific_users' => [],
+        ];
+
+        // Customer-specific approval requirements
+        if ($change->entity_type === 'credit_application') {
+            $customerRules = $this->getCustomerApprovalRules($change);
+            $approvers['additional_count'] = $customerRules['additional_approvers'] ?? 0;
+            $approvers['primary_role'] = $customerRules['required_role'] ?? $requiredRole;
+        }
+
+        // System-wide changes need multiple approvers
+        if ($change->entity_type === 'system_default') {
+            $approvers['additional_count'] = 1; // Always need 2 approvers for system changes
+        }
+
+        return $approvers;
+    }
+
+    /**
+     * Validate rate change request
+     */
+    public function validateRateChange(InterestRateChange $change): array
+    {
+        $errors = [];
+        $rules = self::APPROVAL_RULES[$change->entity_type] ?? [];
+
+        // Check maximum change percentage
+        $maxChangePercentage = $rules['max_change_percentage'] ?? 50;
+        if (abs($change->percentage_change) > $maxChangePercentage) {
+            $errors[] = "Rate change exceeds maximum allowed change of {$maxChangePercentage}%";
+        }
+
+        // Check minimum rate (no negative rates)
+        if ($change->new_rate < 0) {
+            $errors[] = "Interest rate cannot be negative";
+        }
+
+        // Check maximum rate (regulatory limits)
+        $maxRate = setting('credit_financing.max_allowed_rate', 0.50); // 50% max
+        if ($change->new_rate > $maxRate) {
+            $errors[] = "Interest rate exceeds maximum allowed rate of " . ($maxRate * 100) . "%";
+        }
+
+        // Customer-specific validation
+        if ($change->entity_type === 'credit_application') {
+            $customerErrors = $this->validateCustomerRateChange($change);
+            $errors = array_merge($errors, $customerErrors);
+        }
+
+        // Check if sufficient justification is provided
+        if ($this->requiresJustification($change) && empty($change->change_reason)) {
+            $errors[] = "Justification is required for this type of rate change";
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Process approval workflow
+     */
+    public function processApproval(InterestRateChange $change, User $approver, bool $approve, string $notes = null): bool
+    {
+        if (!$this->canApprove($approver, $change)) {
+            throw new \Exception('User does not have permission to approve this rate change');
+        }
+
+        if ($approve) {
+            $change->approve($approver);
+            
+            // Log approval in notes
+            $approvalNote = "Approved by {$approver->name} (" . $this->getUserRole($approver) . ")";
+            if ($notes) {
+                $approvalNote .= " - {$notes}";
+            }
+            
+            $change->update([
+                'change_notes' => $change->change_notes . "\n\n" . $approvalNote
+            ]);
+
+            // Check if this was the final required approval
+            if ($this->hasAllRequiredApprovals($change)) {
+                $change->update(['status' => 'approved']);
+            }
+        } else {
+            $change->reject($approver, $notes);
+        }
+
+        return true;
+    }
+
+    /**
+     * Get approval history for a rate change
+     */
+    public function getApprovalHistory(InterestRateChange $change): array
+    {
+        // Parse approval history from change_notes
+        $notes = $change->change_notes ?? '';
+        $approvals = [];
+        
+        // This would be better stored in a separate approvals table
+        // but for now we parse from notes
+        preg_match_all('/Approved by (.+?) \((.+?)\)/', $notes, $matches, PREG_SET_ORDER);
+        
+        foreach ($matches as $match) {
+            $approvals[] = [
+                'approver_name' => $match[1],
+                'approver_role' => $match[2],
+                'action' => 'approved',
+            ];
+        }
+
+        return $approvals;
+    }
+
+    // Private helper methods
+
+    private function requiresCustomerSpecificApproval(InterestRateChange $change): bool
+    {
+        $application = CreditApplication::find($change->entity_id);
+        if (!$application) {
+            return true;
+        }
+
+        $customerRules = $this->getCustomerApprovalRules($change);
+        $rateDifferencePercentage = abs($change->percentage_change);
+
+        // If it's a rate decrease for a risky customer, always requires approval
+        if ($change->rate_difference < 0) {
+            $maxDecrease = $customerRules['max_rate_decrease'] ?? 1.0;
+            return abs($change->rate_difference * 100) > $maxDecrease;
+        }
+
+        // Rate increases generally don't need as much approval
+        return $rateDifferencePercentage > 2.0; // Auto-approve up to 2% increase
+    }
+
+    private function canApproveCustomerRate(User $user, InterestRateChange $change): bool
+    {
+        $customerRules = $this->getCustomerApprovalRules($change);
+        $requiredRole = $customerRules['required_role'] ?? 'senior';
+
+        return $this->hasRequiredRole($user, $requiredRole);
+    }
+
+    private function getCustomerApprovalRules(InterestRateChange $change): array
+    {
+        $application = CreditApplication::find($change->entity_id);
+        if (!$application) {
+            return self::CUSTOMER_APPROVAL_RULES['high_risk']; // Default to strictest rules
+        }
+
+        // Determine customer risk profile based on credit score
+        $creditScore = $application->credit_score_at_application ?? 70;
+        
+        if ($creditScore >= 80) {
+            return self::CUSTOMER_APPROVAL_RULES['low_risk'];
+        } elseif ($creditScore >= 70) {
+            return self::CUSTOMER_APPROVAL_RULES['medium_risk'];
+        } else {
+            return self::CUSTOMER_APPROVAL_RULES['high_risk'];
+        }
+    }
+
+    private function validateCustomerRateChange(InterestRateChange $change): array
+    {
+        $errors = [];
+        $customerRules = $this->getCustomerApprovalRules($change);
+
+        // Check if rate decrease is within limits
+        if ($change->rate_difference < 0) {
+            $maxDecrease = $customerRules['max_rate_decrease'] ?? 1.0;
+            $actualDecrease = abs($change->rate_difference * 100);
+            
+            if ($actualDecrease > $maxDecrease) {
+                $errors[] = "Rate decrease of {$actualDecrease}% exceeds maximum allowed decrease of {$maxDecrease}%";
+            }
+        }
+
+        return $errors;
+    }
+
+    private function requiresJustification(InterestRateChange $change): bool
+    {
+        if ($change->entity_type === 'credit_application') {
+            $customerRules = $this->getCustomerApprovalRules($change);
+            return $customerRules['requires_justification'] ?? false;
+        }
+
+        // System and partner changes always need justification
+        return in_array($change->entity_type, ['system_default', 'financing_partner']);
+    }
+
+    private function hasRequiredRole(User $user, string $requiredRole): bool
+    {
+        $roleHierarchy = [
+            'junior' => 1,
+            'senior' => 2,
+            'manager' => 3,
+            'director' => 4,
+        ];
+
+        $userRole = $this->getUserRole($user);
+        $userLevel = $roleHierarchy[$userRole] ?? 0;
+        $requiredLevel = $roleHierarchy[$requiredRole] ?? 4;
+
+        return $userLevel >= $requiredLevel;
+    }
+
+    private function getUserRole(User $user): string
+    {
+        // This would typically check user roles from the database
+        // For now, we'll use a simple email-based check
+        if (str_contains($user->email, 'director')) {
+            return 'director';
+        } elseif (str_contains($user->email, 'manager')) {
+            return 'manager';
+        } elseif (str_contains($user->email, 'senior')) {
+            return 'senior';
+        } else {
+            return 'junior';
+        }
+    }
+
+    private function hasAllRequiredApprovals(InterestRateChange $change): bool
+    {
+        $requiredApprovers = $this->getRequiredApprovers($change);
+        $approvalHistory = $this->getApprovalHistory($change);
+        
+        // Count approvals
+        $approvalCount = count($approvalHistory);
+        $requiredCount = 1 + ($requiredApprovers['additional_count'] ?? 0);
+
+        return $approvalCount >= $requiredCount;
+    }
+}

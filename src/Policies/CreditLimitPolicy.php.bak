@@ -1,0 +1,63 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Policies;
+
+use App\Models\User;
+use LoopyLabs\CreditFinancing\Models\CreditLimit;
+use Illuminate\Auth\Access\HandlesAuthorization;
+
+class CreditLimitPolicy
+{
+    use HandlesAuthorization;
+
+    public function viewAny(User $user): bool
+    {
+        return $user->hasPermissionTo('credit.limits.view');
+    }
+
+    public function view(User $user, CreditLimit $limit): bool
+    {
+        return $user->hasPermissionTo('credit.limits.view');
+    }
+
+    public function create(User $user): bool
+    {
+        return $user->hasPermissionTo('credit.limits.create');
+    }
+
+    public function update(User $user, CreditLimit $limit): bool
+    {
+        if (!$limit->canBeEdited()) {
+            return false;
+        }
+
+        return $user->hasPermissionTo('credit.limits.update');
+    }
+
+    public function delete(User $user, CreditLimit $limit): bool
+    {
+        if (!$limit->canBeDeleted()) {
+            return false;
+        }
+
+        return $user->hasPermissionTo('credit.limits.delete');
+    }
+
+    public function activate(User $user, CreditLimit $limit): bool
+    {
+        if ($limit->status !== 'draft') {
+            return false;
+        }
+
+        return $user->hasPermissionTo('credit.limits.activate');
+    }
+
+    public function suspend(User $user, CreditLimit $limit): bool
+    {
+        if ($limit->status !== 'active') {
+            return false;
+        }
+
+        return $user->hasPermissionTo('credit.limits.suspend');
+    }
+}

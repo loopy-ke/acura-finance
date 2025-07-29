@@ -1,0 +1,60 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('financed_invoices', function (Blueprint $table) {
+            $table->id();
+            
+            // Relationships
+            $table->foreignId('invoice_id')->constrained('invoices')->onDelete('cascade');
+            $table->foreignId('credit_application_id')->constrained('credit_applications');
+            
+            // Financing Details
+            $table->decimal('financed_amount', 15, 2);
+            $table->decimal('financing_fee', 15, 2);
+            
+            // Terms
+            $table->decimal('interest_rate', 5, 4);
+            $table->decimal('fee_percentage', 5, 4);
+            $table->integer('term_months');
+            
+            // Status Tracking
+            $table->enum('status', ['pending', 'funded', 'active', 'collected', 'defaulted', 'charged_back'])->default('pending');
+            $table->date('funded_date')->nullable();
+            $table->date('maturity_date')->nullable();
+            $table->date('collected_date')->nullable();
+            
+            // Payment Tracking
+            $table->decimal('total_collected', 15, 2)->default(0.00);
+            $table->decimal('partner_share', 15, 2)->default(0.00);
+            $table->decimal('our_share', 15, 2)->default(0.00);
+            
+            // External Integration
+            $table->string('external_financing_id', 100)->nullable();
+            $table->string('external_status', 50)->nullable();
+            
+            // Journal Entry References
+            $table->foreignId('funding_journal_entry_id')->nullable()->constrained('journal_entries');
+            $table->foreignId('collection_journal_entry_id')->nullable()->constrained('journal_entries');
+            
+            $table->timestamps();
+            
+            $table->unique(['invoice_id'], 'unique_invoice_financing');
+            $table->index(['status']);
+            $table->index(['funded_date']);
+            $table->index(['maturity_date']);
+            $table->index(['external_financing_id']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('financed_invoices');
+    }
+};

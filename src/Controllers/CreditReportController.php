@@ -1,0 +1,305 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Controllers;
+
+use App\Http\Controllers\Controller;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+use App\Models\Customer;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+
+class CreditReportController extends Controller
+{
+    public function __construct()
+    {
+        $this->middleware('auth');
+    }
+
+    public function index()
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        // Overview stats
+        $stats = [
+            'total_applications' => CreditApplication::count(),
+            'pending_applications' => CreditApplication::whereIn('status', ['submitted', 'under_review'])->count(),
+            'approved_applications' => CreditApplication::where('status', 'approved')->count(),
+            'denied_applications' => CreditApplication::where('status', 'denied')->count(),
+            'total_approved_amount' => CreditApplication::where('status', 'approved')->sum('approved_amount'),
+                    ];
+
+        // Monthly application trends (last 12 months)
+        $monthlyTrends = CreditApplication::select(
+                DB::raw('DATE_FORMAT(created_at, "%Y-%m") as month'),
+                DB::raw('COUNT(*) as total_applications'),
+                DB::raw('COUNT(CASE WHEN status = "approved" THEN 1 END) as approved_applications'),
+                DB::raw('SUM(CASE WHEN status = "approved" THEN approved_amount ELSE 0 END) as approved_amount')
+            )
+            ->where('created_at', '>=', now()->subMonths(12))
+            ->groupBy('month')
+            ->orderBy('month')
+            ->get();
+
+        return view('credit-financing::reports.index', compact('stats', 'monthlyTrends'));
+    }
+
+    public function applications(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $dateFrom = $request->get('date_from', now()->startOfMonth()->format('Y-m-d'));
+        $dateTo = $request->get('date_to', now()->endOfMonth()->format('Y-m-d'));
+
+        // Application statistics by status
+        $statusStats = CreditApplication::select('status', DB::raw('COUNT(*) as count'))
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->groupBy('status')
+            ->get()
+            ->keyBy('status');
+
+        // Application volume trends
+        $dailyTrends = CreditApplication::select(
+                DB::raw('DATE(created_at) as date'),
+                DB::raw('COUNT(*) as applications'),
+                DB::raw('SUM(CASE WHEN status = "approved" THEN approved_amount ELSE 0 END) as approved_amount')
+            )
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->groupBy('date')
+            ->orderBy('date')
+            ->get();
+
+        // Top customers by application count
+        $topCustomers = CreditApplication::select('customer_id')
+            ->with('customer:id,company_name')
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->selectRaw('customer_id, COUNT(*) as application_count, SUM(CASE WHEN status = "approved" THEN approved_amount ELSE 0 END) as total_approved')
+            ->groupBy('customer_id')
+            ->orderBy('application_count', 'desc')
+            ->limit(10)
+            ->get();
+
+        return view('credit-financing::reports.applications', compact(
+            'statusStats', 'dailyTrends', 'topCustomers', 'dateFrom', 'dateTo'
+        ));
+    }
+
+    public function performance(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $dateFrom = $request->get('date_from', now()->startOfMonth()->format('Y-m-d'));
+        $dateTo = $request->get('date_to', now()->endOfMonth()->format('Y-m-d'));
+
+        // Overall approval performance
+        $overallPerformance = [
+            'total_applications' => CreditApplication::whereBetween('created_at', [$dateFrom, $dateTo])->count(),
+            'approved_applications' => CreditApplication::whereBetween('created_at', [$dateFrom, $dateTo])->where('status', 'approved')->count(),
+            'denied_applications' => CreditApplication::whereBetween('created_at', [$dateFrom, $dateTo])->where('status', 'denied')->count(),
+            'pending_applications' => CreditApplication::whereBetween('created_at', [$dateFrom, $dateTo])->whereIn('status', ['submitted', 'under_review'])->count(),
+        ];
+        
+        if ($overallPerformance['total_applications'] > 0) {
+            $overallPerformance['approval_rate'] = round(($overallPerformance['approved_applications'] / $overallPerformance['total_applications']) * 100, 2);
+        } else {
+            $overallPerformance['approval_rate'] = 0;
+        }
+
+        // Average processing times
+        $processingTimes = CreditApplication::select(
+                DB::raw('DATE_FORMAT(decision_date, "%Y-%m") as month'),
+                DB::raw('AVG(DATEDIFF(decision_date, submission_date)) as avg_days')
+            )
+            ->whereNotNull('decision_date')
+            ->whereNotNull('submission_date')
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->groupBy('month')
+            ->orderBy('month')
+            ->get();
+
+        return view('credit-financing::reports.performance', compact(
+            'overallPerformance', 'processingTimes', 'dateFrom', 'dateTo'
+        ));
+    }
+
+    public function riskAnalysis(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $dateFrom = $request->get('date_from', now()->startOfMonth()->format('Y-m-d'));
+        $dateTo = $request->get('date_to', now()->endOfMonth()->format('Y-m-d'));
+
+        // Credit score distribution
+        $scoreDistribution = CreditApplication::select(
+                DB::raw('
+                    CASE 
+                        WHEN credit_score_at_application >= 90 THEN "Excellent (90-100)"
+                        WHEN credit_score_at_application >= 80 THEN "Good (80-89)"
+                        WHEN credit_score_at_application >= 70 THEN "Fair (70-79)"
+                        WHEN credit_score_at_application >= 60 THEN "Poor (60-69)"
+                        ELSE "Very Poor (<60)"
+                    END as score_range
+                '),
+                DB::raw('COUNT(*) as count'),
+                DB::raw('ROUND(AVG(credit_score_at_application), 2) as avg_score')
+            )
+            ->whereNotNull('credit_score_at_application')
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->groupBy('score_range')
+            ->get();
+
+        // Risk vs approval correlation
+        $riskApprovalData = CreditApplication::select(
+                DB::raw('credit_score_at_application as score'),
+                'status',
+                'requested_amount',
+                'approved_amount'
+            )
+            ->whereNotNull('credit_score_at_application')
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->get();
+
+        // Denial reasons analysis
+        $denialReasons = CreditApplication::select('denial_reason')
+            ->selectRaw('COUNT(*) as count')
+            ->where('status', 'denied')
+            ->whereNotNull('denial_reason')
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->groupBy('denial_reason')
+            ->orderBy('count', 'desc')
+            ->get();
+
+        return view('credit-financing::reports.risk-analysis', compact(
+            'scoreDistribution', 'riskApprovalData', 'denialReasons', 'dateFrom', 'dateTo'
+        ));
+    }
+
+    public function portfolio(Request $request)
+    {
+        $this->authorize('viewAny', CreditLimit::class);
+
+        // Portfolio stats (using credit applications)
+        $portfolioStats = [
+            'total_disbursed' => CreditApplication::where('status', 'approved')->sum('approved_amount'),
+            'active_customers' => Customer::where('financing_enabled', true)->count(),
+            'average_approval_rate' => $totalApplications > 0 ? 
+                round(($dashboardData['approved_applications'] / $totalApplications) * 100, 2) : 0,
+        ];
+
+        // Top customers by approved amounts
+        $topCustomers = CreditApplication::with('customer:id,company_name,name')
+            ->where('status', 'approved')
+            ->orderBy('approved_amount', 'desc')
+            ->limit(10)
+            ->get();
+
+        return view('credit-financing::reports.portfolio', compact(
+            'portfolioStats', 'topCustomers'
+        ));
+    }
+
+    public function aging(Request $request)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        // Applications aging analysis
+        $agingBuckets = CreditApplication::select(
+                DB::raw('
+                    CASE 
+                        WHEN DATEDIFF(NOW(), created_at) <= 7 THEN "0-7 days"
+                        WHEN DATEDIFF(NOW(), created_at) <= 14 THEN "8-14 days"
+                        WHEN DATEDIFF(NOW(), created_at) <= 30 THEN "15-30 days"
+                        WHEN DATEDIFF(NOW(), created_at) <= 60 THEN "31-60 days"
+                        ELSE "60+ days"
+                    END as age_bucket
+                '),
+                DB::raw('COUNT(*) as count'),
+                DB::raw('SUM(requested_amount) as total_amount')
+            )
+            ->whereIn('status', ['submitted', 'under_review'])
+            ->groupBy('age_bucket')
+            ->get();
+
+        // Pending applications details
+        $pendingApplications = CreditApplication::with(['customer'])
+            ->whereIn('status', ['submitted', 'under_review'])
+            ->select([
+                '*',
+                DB::raw('DATEDIFF(NOW(), created_at) as days_pending')
+            ])
+            ->orderBy('days_pending', 'desc')
+            ->get();
+
+        return view('credit-financing::reports.aging', compact('agingBuckets', 'pendingApplications'));
+    }
+
+    public function export(Request $request, string $type)
+    {
+        $this->authorize('viewAny', CreditApplication::class);
+
+        $dateFrom = $request->get('date_from', now()->startOfMonth()->format('Y-m-d'));
+        $dateTo = $request->get('date_to', now()->endOfMonth()->format('Y-m-d'));
+
+        switch ($type) {
+            case 'applications':
+                return $this->exportApplicationsReport($dateFrom, $dateTo);
+            case 'performance':
+                return $this->exportPerformanceReport($dateFrom, $dateTo);
+            case 'portfolio':
+                return $this->exportPortfolioReport();
+            default:
+                abort(404);
+        }
+    }
+
+    protected function exportApplicationsReport(string $dateFrom, string $dateTo)
+    {
+        $applications = CreditApplication::with(['customer', 'createdBy'])
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->get();
+
+        $headers = [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => 'attachment; filename="credit_applications_' . now()->format('Y-m-d') . '.csv"',
+        ];
+
+        $callback = function() use ($applications) {
+            $file = fopen('php://output', 'w');
+            
+            fputcsv($file, [
+                'Application Number', 'Customer', 'Requested Amount', 'Approved Amount',
+                'Status', 'Credit Score', 'Submission Date', 'Decision Date', 'Created By'
+            ]);
+
+            foreach ($applications as $application) {
+                fputcsv($file, [
+                    $application->application_number,
+                    $application->customer->company_name,
+                    number_format($application->requested_amount, 2),
+                    $application->approved_amount ? number_format($application->approved_amount, 2) : '',
+                    ucfirst($application->status),
+                    $application->credit_score_at_application ?? '',
+                    $application->submission_date?->format('Y-m-d'),
+                    $application->decision_date?->format('Y-m-d'),
+                    $application->createdBy->name,
+                ]);
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
+    protected function exportPerformanceReport(string $dateFrom, string $dateTo)
+    {
+        // Implementation for performance report export
+        // Similar structure to applications export
+    }
+
+    protected function exportPortfolioReport()
+    {
+        // Implementation for portfolio report export
+        // Similar structure to applications export
+    }
+}

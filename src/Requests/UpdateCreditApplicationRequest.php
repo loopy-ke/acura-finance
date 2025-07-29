@@ -1,0 +1,86 @@
+<?php
+
+namespace LoopyLabs\CreditFinancing\Requests;
+
+use Illuminate\Foundation\Http\FormRequest;
+use LoopyLabs\CreditFinancing\Models\CreditApplication;
+
+class UpdateCreditApplicationRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        $application = $this->route('application');
+        return $this->user()->can('update', $application);
+    }
+
+    public function rules(): array
+    {
+        $config = config('credit-financing');
+        $application = $this->route('application');
+        
+        return [
+            'customer_id' => [
+                'required',
+                'exists:customers,id',
+                function ($attribute, $value, $fail) use ($application) {
+                    $customer = \App\Models\Customer::find($value);
+                    if (!$customer || !$customer->financing_enabled) {
+                        $fail('Selected customer is not eligible for financing.');
+                    }
+                    
+                    // Check for duplicate active applications (excluding current)
+                    $hasActiveApplication = CreditApplication::where('customer_id', $value)
+                        ->whereIn('status', ['submitted', 'under_review'])
+                        ->where('id', '!=', $application->id)
+                        ->exists();
+                        
+                    if ($hasActiveApplication) {
+                        $fail('Customer already has an active credit application.');
+                    }
+                },
+            ],
+            'requested_amount' => [
+                'required',
+                'numeric',
+                'min:' . ($config['limits']['min_application_amount'] ?? 10000),
+                'max:' . ($config['limits']['max_single_application'] ?? 1000000),
+            ],
+            'requested_term_months' => [
+                'required',
+                'integer',
+                'min:1',
+                'max:' . ($config['limits']['max_term_months'] ?? 60),
+            ],
+            'purpose' => 'required|string|max:500',
+            'business_justification' => 'required|string|max:1000',
+        ];
+    }
+
+    public function messages(): array
+    {
+        $config = config('credit-financing');
+        
+        return [
+            'customer_id.required' => 'Please select a customer.',
+            'customer_id.exists' => 'Selected customer does not exist.',
+            'requested_amount.required' => 'Please enter the requested amount.',
+            'requested_amount.min' => 'Minimum application amount is ' . number_format($config['limits']['min_application_amount'] ?? 10000, 2),
+            'requested_amount.max' => 'Maximum application amount is ' . number_format($config['limits']['max_single_application'] ?? 1000000, 2),
+            'requested_term_months.required' => 'Please specify the repayment term.',
+            'requested_term_months.max' => 'Maximum term is ' . ($config['limits']['max_term_months'] ?? 60) . ' months.',
+            'purpose.required' => 'Please describe the purpose of this credit application.',
+            'business_justification.required' => 'Please provide business justification for this credit request.',
+        ];
+    }
+
+    public function attributes(): array
+    {
+        return [
+            'customer_id' => 'customer',
+            'requested_amount' => 'requested amount',
+            'requested_term_months' => 'term (months)',
+            'purpose' => 'purpose',
+            'business_justification' => 'business justification',
+        ];
+    }
+}
