@@ -1,6 +1,6 @@
 {
     "name": "loopylabs/acura-finance",
-    "description": "Credit and financing module for Acura ERP system",
+    "description": "Credit and financing app for Acura ERP system",
     "type": "library",
     "license": "MIT",
     "authors": [
